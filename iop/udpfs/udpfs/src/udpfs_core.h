@@ -15,6 +15,10 @@
 /* Initialize core UDPFS (socket + discovery) */
 int udpfs_core_init(void);
 
+/* Recreate the transport socket and repeat service discovery. Existing
+ * server-side handles are no longer valid after this call. */
+int udpfs_core_reconnect(void);
+
 /* Cleanup core UDPFS */
 void udpfs_core_exit(void);
 

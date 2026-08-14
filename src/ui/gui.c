@@ -41,6 +41,7 @@ static int persistVideoMode(const char *configValue);
 static int uiDetailPane(TargetList *titles, Target *target);
 static int uiSearchScreen();
 static int uiFtpSettings();
+static int uiEditIPv4(const char *label, char value[16]);
 
 // Video modes selectable from Settings.
 static const struct {
@@ -129,6 +130,7 @@ static char lineBuffer[255];
 // Total titles in the library (set once in uiLoop). Used by the status bar;
 // a non-zero value means the game server was reachable at startup.
 static int libraryTotal = 0;
+static int dashboardUdpfsStatus = 1;
 
 // Restrained translucent surfaces keep the custom wallpaper visible while
 // giving the list, metadata and controls a clear visual hierarchy.
@@ -569,6 +571,13 @@ int uiLoop(TargetList *titles) {
 
   // Record the library size for the status bar (non-zero == server reachable)
   libraryTotal = titles->total;
+  if (LAUNCHER_OPTIONS.mode & MODE_UDPFS) {
+    dashboardUdpfsStatus = ftpGetUdpfsConnectionStatus();
+    if (dashboardUdpfsStatus < 0)
+      dashboardUdpfsStatus = 0;
+  } else {
+    dashboardUdpfsStatus = 1;
+  }
 
   // Load favorites/recently-played and build the initial view
   favoritesInit();
@@ -587,6 +596,8 @@ int uiLoop(TargetList *titles) {
   int frameCount = 0;
   int prevInput = 0;
   int input = 0;
+  int networkPollFrames = 0;
+  int reconnectCooldownFrames = 0;
   float scrollAccum = 0.0f; // Fractional analog scroll position
   while (1) {
     gsKit_clear(gsGlobal, BGColor);
@@ -615,6 +626,30 @@ int uiLoop(TargetList *titles) {
       input = waitForInput(-1); // Used to ignore held inputs after returning from title options
     else
       input = pollInput();
+
+    // UDPFS marks its session disconnected after a timed-out request. Poll
+    // that cheap state flag periodically and perform a bounded rediscovery
+    // without rebooting the IOP or leaving the dashboard. The cover worker is
+    // paused because rediscovery invalidates every server-side file handle.
+    if (LAUNCHER_OPTIONS.mode & MODE_UDPFS) {
+      if (reconnectCooldownFrames > 0)
+        reconnectCooldownFrames--;
+      if (++networkPollFrames >= 300) {
+        int status = ftpGetUdpfsConnectionStatus();
+        networkPollFrames = 0;
+        dashboardUdpfsStatus = (status > 0) ? 1 : 0;
+        if ((status <= 0) && (reconnectCooldownFrames == 0)) {
+          coverArtPause();
+          status = ftpRequestUdpfsReconnect();
+          dashboardUdpfsStatus = (status > 0) ? 1 : 0;
+          coverArtResume();
+          // A healthy server gets another lightweight check in five seconds;
+          // a failed discovery waits thirty seconds before blocking the UI on
+          // another bounded attempt.
+          reconnectCooldownFrames = (status > 0) ? 300 : 1800;
+        }
+      }
+    }
 
     // Analog speed-scroll: the left stick scrolls with speed proportional
     // to deflection, bypassing the digital input repeat throttle below
@@ -958,11 +993,14 @@ void drawTitleView(Target **view, int viewTotal, const char *viewName, int selec
 
   // Shared-network status: UDPFS and FTP use the same PS2IP/SMAP interface
   // while the dashboard is open.
-  int netOnline = (libraryTotal > 0);
-  uint64_t netColor = netOnline ? GS_SETREG_RGBA(0x40, 0xC0, 0x40, 0x80) : GS_SETREG_RGBA(0xC0, 0x40, 0x40, 0x80);
+  int netOnline = !(LAUNCHER_OPTIONS.mode & MODE_UDPFS) ||
+                  (dashboardUdpfsStatus > 0);
+  uint64_t netColor = netOnline
+                          ? GS_SETREG_RGBA(0x40, 0xC0, 0x40, 0x80)
+                          : GS_SETREG_RGBA(0xD0, 0x90, 0x20, 0x80);
   snprintf(lineBuffer, 255, "%s %s | FTP %s",
            (LAUNCHER_OPTIONS.udpfsIp[0] != '\0') ? LAUNCHER_OPTIONS.udpfsIp : "no IP",
-           netOnline ? "online" : "offline",
+           netOnline ? "online" : "reconnecting",
            ftpIsBackgroundRunning() ? "on" : "off");
   int statusDot = (int)(6 * scale);
   int leftHeaderEnd = gsGlobal->Width * 42 / 100;
@@ -1257,48 +1295,240 @@ static int uiSearchScreen() {
   }
 }
 
-// Background FTP status. UDPFS and ps2ftpd share one PS2IP stack, so leaving
-// this screen returns directly to the live game browser; no IOP reset or ELF
-// handoff is involved.
-static int uiFtpSettings() {
-  int baseX = keepoutArea + 10;
+// Controller-friendly dotted-quad editor. It deliberately edits one octet at
+// a time: no keyboard is needed, every intermediate value remains bounded,
+// and the caller still performs semantic validation (for example, ensuring a
+// subnet mask is contiguous).
+static int uiEditIPv4(const char *label, char value[16]) {
+  unsigned int octets[4] = {0, 0, 0, 0};
+  int selected = 0;
+  char display[40];
+
+  if (sscanf(value, "%u.%u.%u.%u", &octets[0], &octets[1],
+             &octets[2], &octets[3]) != 4 ||
+      octets[0] > 255 || octets[1] > 255 ||
+      octets[2] > 255 || octets[3] > 255) {
+    memset(octets, 0, sizeof(octets));
+  }
 
   while (1) {
     gsKit_clear(gsGlobal, BGColor);
     gsKit_TexManager_nextFrame(gsGlobal);
+    gsKit_prim_sprite(gsGlobal, 0, 0, gsGlobal->Width, headerHeight, 0,
+                      PanelStrongColor);
+    drawTextWindow(keepoutArea, 0, gsGlobal->Width - keepoutArea,
+                   headerHeight, 0, HeaderTextColor, ALIGN_CENTER, label);
 
-    drawTextWindow(baseX, headerHeight - getFontLineHeight(), gsGlobal->Width - baseX, 0, 0, HeaderTextColor, ALIGN_HCENTER, "Memory Card FTP");
-    if (ftpIsBackgroundRunning()) {
-      const char *ip = ftpGetBackgroundIP();
-      if (ip[0] == '\0')
-        ip = LAUNCHER_OPTIONS.udpfsIp;
-      snprintf(lineBuffer, 255,
-               "FTP server is running automatically\n\n"
-               "ftp://%s\nMemory card: /mc/0/\n\n"
-               "UDPFS game browsing and FTP are sharing the network.",
-               ip);
-    } else {
-      snprintf(lineBuffer, 255,
-               "Background FTP is not running (error %d)\n\n"
-               "%s\n\n"
-               "Game browsing remains available. Card Maintenance still\n"
-               "provides the separate uLaunchELF recovery path.",
-               ftpGetBackgroundError(), ftpGetLastDiagnostic());
-    }
-    drawTextWindow(baseX, headerHeight, gsGlobal->Width - baseX, gsGlobal->Height - footerHeight, 0,
-                   ftpIsBackgroundRunning() ? FontMainColor : ErrorTextColor,
-                   ALIGN_CENTER, lineBuffer);
+    snprintf(display, sizeof(display),
+             selected == 0 ? "[%03u] . %03u  . %03u  . %03u" :
+             selected == 1 ? " %03u  .[%03u] . %03u  . %03u" :
+             selected == 2 ? " %03u  . %03u  .[%03u] . %03u" :
+                             " %03u  . %03u  . %03u  .[%03u]",
+             octets[0], octets[1], octets[2], octets[3]);
+    drawTextWindow(0, headerHeight, gsGlobal->Width,
+                   gsGlobal->Height - footerHeight, 0, ColorSelected,
+                   ALIGN_CENTER, display);
+    drawTextWindow(keepoutArea, headerHeight + getFontLineHeight(),
+                   gsGlobal->Width - keepoutArea,
+                   gsGlobal->Height - footerHeight, 0, HeaderTextColor,
+                   ALIGN_HCENTER,
+                   "Left/Right: select octet    Up/Down: change by 1");
 
-    const IconHint backHint[] = {{ICON_CIRCLE, "Back to games"}};
+    const IconHint editHints[] = {
+        {ICON_L1, "-10"},
+        {ICON_R1, "+10"},
+        {ICON_CROSS, "Use address"},
+        {ICON_CIRCLE, "Cancel"},
+    };
     drawIconHintRow(gsGlobal->Height - footerHeight, gsGlobal->Height - 1,
-                    backHint, sizeof(backHint) / sizeof(backHint[0]));
+                    editHints, sizeof(editHints) / sizeof(editHints[0]));
     gsKit_queue_exec(gsGlobal);
     gsKit_finish();
     uiSyncFlip();
 
     int input = waitForInput(-1);
-    if (input & PAD_CIRCLE)
+    if (input & PAD_LEFT) {
+      selected = (selected + 3) % 4;
+    } else if (input & PAD_RIGHT) {
+      selected = (selected + 1) % 4;
+    } else if (input & (PAD_UP | PAD_DOWN | PAD_L1 | PAD_R1)) {
+      int delta = (input & PAD_UP) ? 1 :
+                  (input & PAD_DOWN) ? -1 :
+                  (input & PAD_R1) ? 10 : -10;
+      int next = (int)octets[selected] + delta;
+      if (next < 0)
+        next = 0;
+      if (next > 255)
+        next = 255;
+      octets[selected] = (unsigned int)next;
+    } else if (input & PAD_CROSS) {
+      snprintf(value, 16, "%u.%u.%u.%u", octets[0], octets[1],
+               octets[2], octets[3]);
+      return 1;
+    } else if (input & PAD_CIRCLE) {
       return 0;
+    }
+  }
+}
+
+// Integrated network settings. UDPFS and ps2ftpd share one PS2IP/SMAP stack,
+// so changing the console address updates both the dashboard profile and the
+// separate Neutrino in-game configuration. A restart is required only after
+// saving address-mode changes; rediscovering the Windows server stays in the
+// current dashboard.
+static int uiFtpSettings() {
+  enum {
+    NET_ITEM_MODE = 0,
+    NET_ITEM_IP,
+    NET_ITEM_MASK,
+    NET_ITEM_GATEWAY,
+    NET_ITEM_RECONNECT,
+    NET_ITEM_SAVE_RESTART,
+    NET_ITEM_BACK,
+    NET_ITEMS_TOTAL,
+  };
+  FtpConfig cfg;
+  int selected = 0;
+  int loadResult = ftpLoadConfig(&cfg);
+  int actionResult = 0;
+  char actionMessage[160] = "";
+  int baseX = keepoutArea + 10;
+  int lineHeight = getFontLineHeight();
+
+  if (loadResult < 0)
+    snprintf(actionMessage, sizeof(actionMessage),
+             "Saved profile was invalid (%d); showing safe defaults.",
+             loadResult);
+
+  while (1) {
+    gsKit_clear(gsGlobal, BGColor);
+    gsKit_TexManager_nextFrame(gsGlobal);
+    gsKit_prim_sprite(gsGlobal, 0, 0, gsGlobal->Width, headerHeight, 0,
+                      PanelStrongColor);
+    drawTextWindow(baseX, 0, gsGlobal->Width - baseX, headerHeight, 0,
+                   HeaderTextColor, ALIGN_CENTER,
+                   "Network & integrated memory-card FTP");
+
+    const char *activeIP = ftpGetBackgroundIP();
+    if (activeIP[0] == '\0')
+      activeIP = cfg.ip;
+    snprintf(lineBuffer, 255,
+             "FTP %s: ftp://%s  (/mc/0/)    UDPFS server: %s",
+             ftpIsBackgroundRunning() ? "running" : "failed",
+             activeIP,
+             dashboardUdpfsStatus > 0 ? "connected" : "reconnecting");
+    int y = drawTextWindow(baseX, headerHeight + lineHeight / 2,
+                           gsGlobal->Width - baseX, 0, 0,
+                           ftpIsBackgroundRunning() ? FontMainColor : ErrorTextColor,
+                           ALIGN_HCENTER, lineBuffer);
+    y += lineHeight / 2;
+
+#define DRAW_NET_ITEM(index, text) do {                                                    \
+      if (selected == (index))                                                              \
+        gsKit_prim_sprite(gsGlobal, baseX - 6, y, gsGlobal->Width - baseX + 6,              \
+                          y + lineHeight, 0, SelectionPanelColor);                           \
+      y = drawText(baseX, y, 1, 0, 0,                                                       \
+                   selected == (index) ? ColorSelected : FontMainColor, (text));             \
+    } while (0)
+
+    snprintf(lineBuffer, 255, "Address mode:  %s",
+             cfg.mode == FTP_NET_DHCP ? "DHCP (automatic)" : "Static");
+    DRAW_NET_ITEM(NET_ITEM_MODE, lineBuffer);
+    snprintf(lineBuffer, 255, "%s:  %s",
+             cfg.mode == FTP_NET_DHCP ? "DHCP fallback / in-game IP" : "Console IP",
+             cfg.ip);
+    DRAW_NET_ITEM(NET_ITEM_IP, lineBuffer);
+    snprintf(lineBuffer, 255, "Subnet mask:  %s", cfg.mask);
+    DRAW_NET_ITEM(NET_ITEM_MASK, lineBuffer);
+    snprintf(lineBuffer, 255, "Gateway:  %s", cfg.gw);
+    DRAW_NET_ITEM(NET_ITEM_GATEWAY, lineBuffer);
+    DRAW_NET_ITEM(NET_ITEM_RECONNECT, "Reconnect to UDPFS server now");
+    DRAW_NET_ITEM(NET_ITEM_SAVE_RESTART,
+                  "Save network profile and restart dashboard");
+    DRAW_NET_ITEM(NET_ITEM_BACK, "Back to games");
+#undef DRAW_NET_ITEM
+
+    y += lineHeight / 2;
+    drawTextWindow(baseX, y, gsGlobal->Width - baseX,
+                   gsGlobal->Height - footerHeight, 0, HeaderTextColor,
+                   ALIGN_HCENTER,
+                   "DNS is not used: FTP and UDPFS use direct IP/local discovery.");
+    if (actionMessage[0] != '\0') {
+      drawTextWindow(baseX, y + lineHeight, gsGlobal->Width - baseX,
+                     gsGlobal->Height - footerHeight, 0,
+                     actionResult < 0 ? ErrorTextColor : WarnTextColor,
+                     ALIGN_HCENTER, actionMessage);
+    }
+
+    const IconHint networkHints[] = {
+        {ICON_CROSS, "Edit / run"},
+        {ICON_CIRCLE, "Back"},
+    };
+    drawIconHintRow(gsGlobal->Height - footerHeight, gsGlobal->Height - 1,
+                    networkHints,
+                    sizeof(networkHints) / sizeof(networkHints[0]));
+    gsKit_queue_exec(gsGlobal);
+    gsKit_finish();
+    uiSyncFlip();
+
+    int input = waitForInput(-1);
+    if (input & PAD_UP) {
+      selected = (selected - 1 + NET_ITEMS_TOTAL) % NET_ITEMS_TOTAL;
+    } else if (input & PAD_DOWN) {
+      selected = (selected + 1) % NET_ITEMS_TOTAL;
+    } else if ((input & (PAD_LEFT | PAD_RIGHT)) &&
+               selected == NET_ITEM_MODE) {
+      cfg.mode = cfg.mode == FTP_NET_DHCP ? FTP_NET_STATIC : FTP_NET_DHCP;
+      actionMessage[0] = '\0';
+    } else if (input & PAD_CIRCLE) {
+      return 0;
+    } else if (input & PAD_CROSS) {
+      actionMessage[0] = '\0';
+      actionResult = 0;
+      if (selected == NET_ITEM_MODE) {
+        cfg.mode = cfg.mode == FTP_NET_DHCP ? FTP_NET_STATIC : FTP_NET_DHCP;
+      } else if (selected == NET_ITEM_IP) {
+        uiEditIPv4(cfg.mode == FTP_NET_DHCP ?
+                       "Edit DHCP fallback / in-game IP" : "Edit console IP",
+                   cfg.ip);
+      } else if (selected == NET_ITEM_MASK) {
+        uiEditIPv4("Edit subnet mask", cfg.mask);
+      } else if (selected == NET_ITEM_GATEWAY) {
+        uiEditIPv4("Edit gateway", cfg.gw);
+      } else if (selected == NET_ITEM_RECONNECT) {
+        dashboardUdpfsStatus = 0;
+        actionResult = ftpRequestUdpfsReconnect();
+        dashboardUdpfsStatus = actionResult > 0 ? 1 : 0;
+        if (actionResult > 0) {
+          strlcpy(actionMessage, "UDPFS server reconnected.",
+                  sizeof(actionMessage));
+        } else {
+          snprintf(actionMessage, sizeof(actionMessage),
+                   "UDPFS server was not found (%d); automatic retry remains active.",
+                   actionResult);
+        }
+      } else if (selected == NET_ITEM_SAVE_RESTART) {
+        actionResult = ftpValidateConfig(&cfg);
+        if (actionResult == 0)
+          actionResult = ftpSaveConfig(&cfg);
+        if (actionResult == 0)
+          actionResult = ftpSyncNeutrinoConfig(&cfg);
+        if (actionResult == 0) {
+          // The staged restart path tears down DEV9/fileXio in the proven
+          // order, then reloads NHDDL from EE memory. It should not return.
+          actionResult = restartDashboardNow();
+          snprintf(actionMessage, sizeof(actionMessage),
+                   "Profile saved, but dashboard restart failed (%d).",
+                   actionResult);
+        } else {
+          snprintf(actionMessage, sizeof(actionMessage),
+                   "Network profile was not applied (error %d).",
+                   actionResult);
+        }
+      } else if (selected == NET_ITEM_BACK) {
+        return 0;
+      }
+    }
   }
 }
 

@@ -242,9 +242,25 @@ static int _write_with_combined_header(udprdma_socket_t *socket, const void *req
  */
 int udpfs_core_init(void)
 {
+    return udpfs_core_reconnect();
+}
+
+/*
+ * Recreate the socket before discovery. A timed-out transfer can leave
+ * sequence/window state behind, and a restarted server invalidates every
+ * old handle anyway. Starting with a clean transport is deterministic and
+ * keeps reconnect independent of the failure that triggered it.
+ */
+int udpfs_core_reconnect(void)
+{
     int ret;
 
-    M_DEBUG("UDPFS: initializing core\n");
+    M_DEBUG("UDPFS: reconnecting core\n");
+
+    if (g_socket != NULL) {
+        udprdma_destroy(g_socket);
+        g_socket = NULL;
+    }
 
     /* Create UDPRDMA socket */
     g_socket = udprdma_create(UDPFS_PORT, UDPRDMA_SVC_UDPFS);

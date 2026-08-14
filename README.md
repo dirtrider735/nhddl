@@ -50,6 +50,12 @@ Ethernet cable or UDPFS server is available during boot, startup reports the
 network/backend failure; reconnecting later cannot populate a title list that
 was never discovered, so restart NHDDL after restoring the link/server.
 
+The `feature/editable-network-settings` branch adds an experimental Settings
+page for DHCP/static IPv4 configuration plus in-place UDPFS rediscovery after a
+cable or server interruption. See
+[`docs/editable-network-settings.md`](docs/editable-network-settings.md) for
+its validation status and safety behavior.
+
 ### Important notes
 
 NHDDL requires a full [Neutrino](https://github.com/rickgaiser/neutrino) installation to be present at one of the following paths:
