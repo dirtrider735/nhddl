@@ -3,16 +3,10 @@
 
 #include <stdint.h>
 
-// Dashboard FTP support. The normal path loads PS2IP, socket-backed UDPFS and
-// ps2ftpd together, so FTP stays available while the title list is active.
-// The older IOP-replacement entry point remains below as a diagnostic/fallback
-// implementation, but the UI no longer invokes it.
-//
-// The live shared server uses the launcher's UDPFS address plus the mask and
-// gateway from SYS-CONF/IPCONFIG.DAT. The ftp.cfg helpers below belong to the
-// older replacement-stack diagnostic path and are not used by the title-list
-// UI; they remain available for troubleshooting without changing the proven
-// resident PS2IP/SMAP path.
+// Dashboard network support. PS2IP, socket-backed UDPFS and ps2ftpd share one
+// SMAP interface, so the same persisted configuration controls game browsing
+// and the FTP server.  The configuration lives on memory card and is readable
+// before the UDPFS device exists.
 
 typedef enum {
   FTP_NET_STATIC = 0,
@@ -26,13 +20,23 @@ typedef struct {
   char gw[16];
 } FtpConfig;
 
-// Loads the persisted FTP config into cfg. If nhddl/ftp.cfg doesn't exist,
-// seeds defaults from IPCONFIG.DAT (static mode) and returns 0 without
-// writing a file. Always leaves cfg populated with usable values.
-void ftpLoadConfig(FtpConfig *cfg);
+// Loads the persisted network config into cfg. Returns 1 when a saved or
+// rollback config was read and 0 when safe defaults were seeded from
+// nhddl.yaml/IPCONFIG.DAT. Invalid/partial saved files are ignored so they
+// cannot cause a boot loop; cfg is always initialized.
+int ftpLoadConfig(FtpConfig *cfg);
 
-// Persists cfg to nhddl/ftp.cfg on the first writable device.
-void ftpSaveConfig(const FtpConfig *cfg);
+// Validates and persists cfg to the memory card that launched NHDDL (falling
+// back to the other slot). The static address is also the fallback/in-game
+// address when dashboard DHCP is enabled.
+int ftpValidateConfig(const FtpConfig *cfg);
+int ftpSaveConfig(const FtpConfig *cfg);
+
+// Keeps Neutrino's separate in-game ministack on the same saved static or
+// DHCP-fallback address. Returns 0 when every discovered UDPFS config was
+// updated, -ENOENT when no Neutrino config was present, or another negative
+// errno-style result on failure.
+int ftpSyncNeutrinoConfig(const FtpConfig *cfg);
 
 // Starts the FTP server using cfg. On success returns 0 and writes the IP the
 // server is reachable at into ipOut (the DHCP-assigned address in DHCP mode).
@@ -58,6 +62,12 @@ int ftpShutdownNetwork(void);
 // ps2ips before UDPFS and ps2ftpd start.
 char *ftpBuildSmapArguments(uint32_t *argLength);
 int ftpAttachSharedNetwork(char *ipOut, int ipOutLen);
+
+// The dashboard UDPFS IOP module keeps trying service discovery after a cable
+// or server interruption. Status is 1=connected, 0=reconnecting, negative if
+// the device is unavailable. The request function wakes an immediate retry.
+int ftpGetUdpfsConnectionStatus(void);
+int ftpRequestUdpfsReconnect(void);
 
 // Background ps2ftpd status exposed to the game-list UI.
 void ftpSetBackgroundStatus(int result);

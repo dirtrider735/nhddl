@@ -4,6 +4,7 @@
 #include "devices/title_id.h"
 #include "dprintf.h"
 #include "forwarder.h"
+#include "ftp.h"
 #include "neutrino.h"
 #include "options.h"
 #include "target.h"
@@ -222,6 +223,19 @@ void showNeutrinoSplash() {
   uiSplashSetNeutrinoVersion(neutrinoVersion);
   uiSplashLogString(LEVEL_INFO, "Found Neutrino at\n%s\n", NEUTRINO_ELF_PATH);
   free(neutrinoVersion);
+
+  /* Dashboard DHCP and Neutrino's in-game ministack cannot share an IOP
+   * stack, so keep the latter's static module argument synchronized with the
+   * saved address (the most recent DHCP lease when DHCP is selected). */
+  if (LAUNCHER_OPTIONS.mode & MODE_UDPFS) {
+    FtpConfig networkConfig;
+    if (ftpLoadConfig(&networkConfig) >= 0) {
+      int syncResult = ftpSyncNeutrinoConfig(&networkConfig);
+      if ((syncResult < 0) && (syncResult != -ENOENT))
+        DPRINTF("WARN: could not sync Neutrino network config: %d\n",
+                syncResult);
+    }
+  }
 }
 
 // Does a quick init for options given in argv

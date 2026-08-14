@@ -44,7 +44,13 @@ IRX_DEFINE(ps2ips);
 IRX_DEFINE(smap_ps2ip);
 IRX_DEFINE(ps2ftpd);
 
-static const char ftpConfigFile[] = "/ftp.cfg";
+#define UDPFS_DEVCTL_CONNECTION_STATUS 0x55445001
+#define UDPFS_DEVCTL_RECONNECT         0x55445002
+
+static const char *networkConfigPaths[] = {
+    "mc0:/SYS-CONF/NHDDL-NET.CFG",
+    "mc1:/SYS-CONF/NHDDL-NET.CFG",
+};
 static int ps2ipClientReady = 0;
 static int replacementPadReady = 0;
 static char ftpLastDiagnostic[256] = "stage=idle";
@@ -200,31 +206,12 @@ static void readIPConfig(char *ip, char *mask, char *gw) {
   }
 }
 
-// Network settings needed before UDPFS itself is mounted.  The explicit
-// udpfs_ip option remains authoritative; IPCONFIG.DAT supplies the mask and
-// gateway (and the address when no option was provided).
+// Network settings are needed before UDPFS itself is mounted. A saved
+// memory-card configuration is authoritative; on first run the legacy
+// nhddl.yaml/IPCONFIG.DAT sources seed equivalent defaults.
 static int loadStartupNetworkConfig(FtpConfig *cfg) {
-  cfg->mode = FTP_NET_STATIC;
-  cfg->ip[0] = '\0';
-  strlcpy(cfg->mask, "255.255.255.0", sizeof(cfg->mask));
-  cfg->gw[0] = '\0';
-  readIPConfig(cfg->ip, cfg->mask, cfg->gw);
-
-  if (LAUNCHER_OPTIONS.udpfsIp[0] != '\0')
-    strlcpy(cfg->ip, LAUNCHER_OPTIONS.udpfsIp, sizeof(cfg->ip));
-  else if (cfg->ip[0] != '\0')
-    strlcpy(LAUNCHER_OPTIONS.udpfsIp, cfg->ip,
-            sizeof(LAUNCHER_OPTIONS.udpfsIp));
-
-  if (cfg->ip[0] == '\0')
-    return -ENOENT;
-  if (cfg->gw[0] == '\0') {
-    strlcpy(cfg->gw, cfg->ip, sizeof(cfg->gw));
-    char *lastDot = strrchr(cfg->gw, '.');
-    if (lastDot != NULL)
-      strcpy(lastDot, ".1");
-  }
-  return 0;
+  int result = ftpLoadConfig(cfg);
+  return (result < 0) ? result : ftpValidateConfig(cfg);
 }
 
 char *ftpBuildSmapArguments(uint32_t *argLength) {
@@ -250,63 +237,25 @@ char *ftpBuildSmapArguments(uint32_t *argLength) {
   return args;
 }
 
-// Returns the first writable device (BDM/MMCE/UDPFS), preferring its metadev
-static struct DeviceMapEntry *firstConfigDevice() {
-  for (int i = 0; i < MAX_DEVICES; i++) {
-    if ((deviceModeMap[i].mode == MODE_NONE) || (deviceModeMap[i].mode == MODE_ALL) || (deviceModeMap[i].mountpoint == NULL))
-      continue;
-    if (deviceModeMap[i].metadev)
-      return deviceModeMap[i].metadev;
-    return &deviceModeMap[i];
+static void getMemoryCardOrder(int order[2]) {
+  order[0] = 0;
+  order[1] = 1;
+  if (!strncmp(SELF_ELF_PATH, "mc1:", 4)) {
+    order[0] = 1;
+    order[1] = 0;
   }
-  return NULL;
 }
 
-void ftpLoadConfig(FtpConfig *cfg) {
-  // Defaults
+static void seedNetworkDefaults(FtpConfig *cfg) {
   cfg->mode = FTP_NET_STATIC;
   cfg->ip[0] = '\0';
   strlcpy(cfg->mask, "255.255.255.0", sizeof(cfg->mask));
   cfg->gw[0] = '\0';
 
-  struct DeviceMapEntry *device = firstConfigDevice();
-  char path[PATH_MAX];
-  int haveFile = 0;
+  readIPConfig(cfg->ip, cfg->mask, cfg->gw);
+  if (LAUNCHER_OPTIONS.udpfsIp[0] != '\0')
+    strlcpy(cfg->ip, LAUNCHER_OPTIONS.udpfsIp, sizeof(cfg->ip));
 
-  if (device != NULL) {
-    buildConfigFilePath(path, device->mountpoint, ftpConfigFile);
-    FILE *file = fopen(path, "rb");
-    if (file != NULL) {
-      haveFile = 1;
-      char line[64];
-      while (fgets(line, sizeof(line), file) != NULL) {
-        line[strcspn(line, "\r\n")] = '\0';
-        char *eq = strchr(line, '=');
-        if (eq == NULL)
-          continue;
-        *eq = '\0';
-        const char *val = eq + 1;
-        if (!strcmp(line, "mode"))
-          cfg->mode = (!strcmp(val, "dhcp")) ? FTP_NET_DHCP : FTP_NET_STATIC;
-        else if (!strcmp(line, "ip"))
-          strlcpy(cfg->ip, val, sizeof(cfg->ip));
-        else if (!strcmp(line, "mask"))
-          strlcpy(cfg->mask, val, sizeof(cfg->mask));
-        else if (!strcmp(line, "gw"))
-          strlcpy(cfg->gw, val, sizeof(cfg->gw));
-      }
-      fclose(file);
-    }
-  }
-
-  // First run only: seed static defaults from IPCONFIG.DAT / udpfs_ip so the
-  // initial configuration matches the known-good address. Once ftp.cfg
-  // exists, the user's saved choice is authoritative.
-  if (!haveFile) {
-    readIPConfig(cfg->ip, cfg->mask, cfg->gw);
-    if (cfg->ip[0] == '\0')
-      strlcpy(cfg->ip, LAUNCHER_OPTIONS.udpfsIp, sizeof(cfg->ip));
-  }
   if (cfg->gw[0] == '\0' && cfg->ip[0] != '\0') {
     strlcpy(cfg->gw, cfg->ip, sizeof(cfg->gw));
     char *lastDot = strrchr(cfg->gw, '.');
@@ -315,30 +264,369 @@ void ftpLoadConfig(FtpConfig *cfg) {
   }
 }
 
-void ftpSaveConfig(const FtpConfig *cfg) {
-  struct DeviceMapEntry *device = firstConfigDevice();
-  if (device == NULL)
-    return;
+static int isContiguousNetmask(u32 parsedMask) {
+  u32 canonical = ((parsedMask & 0x000000ff) << 24) |
+                  ((parsedMask & 0x0000ff00) << 8) |
+                  ((parsedMask & 0x00ff0000) >> 8) |
+                  ((parsedMask & 0xff000000) >> 24);
+  u32 inverse = ~canonical;
+  return (canonical != 0) && ((inverse & (inverse + 1)) == 0);
+}
 
-  char path[PATH_MAX];
-  char dirPath[PATH_MAX];
-  buildConfigFilePath(dirPath, device->mountpoint, NULL);
-  buildConfigFilePath(path, device->mountpoint, ftpConfigFile);
+int ftpValidateConfig(const FtpConfig *cfg) {
+  u32 ip, mask, gw;
+  if (cfg == NULL ||
+      (cfg->mode != FTP_NET_STATIC && cfg->mode != FTP_NET_DHCP) ||
+      !parseIPv4(cfg->ip, &ip) || !parseIPv4(cfg->mask, &mask) ||
+      !parseIPv4(cfg->gw, &gw) || !isContiguousNetmask(mask))
+    return -EINVAL;
 
-  struct stat st;
-  if (stat(dirPath, &st) == -1)
-    mkdir(dirPath, 0777);
+  // Reject unspecified, broadcast and multicast source addresses.  A zero
+  // gateway remains valid for an isolated same-subnet UDPFS installation.
+  unsigned int first = ip & 0xff;
+  unsigned int last = (ip >> 24) & 0xff;
+  if ((ip == INADDR_ANY) || (first >= 224) || (first == 255) || (last == 255))
+    return -EINVAL;
+  return 0;
+}
 
-  FILE *file = fopen(path, "wb");
-  if (file == NULL) {
-    DPRINTF("FTP: failed to write %s\n", path);
-    return;
+int ftpLoadConfig(FtpConfig *cfg) {
+  if (cfg == NULL)
+    return -EINVAL;
+  seedNetworkDefaults(cfg);
+
+  int order[2];
+  getMemoryCardOrder(order);
+  for (int pathIndex = 0; pathIndex < 2; pathIndex++) {
+    const char *path = networkConfigPaths[order[pathIndex]];
+    char backup[64];
+    if (snprintf(backup, sizeof(backup), "%s.BAK", path) >=
+        (int)sizeof(backup))
+      continue;
+
+    /* A save uses PATH.TMP -> PATH with PATH.BAK as the rollback copy. If
+     * power was lost between the two renames, accepting the backup here keeps
+     * a half-written profile from turning the next boot into a failure loop. */
+    const char *candidates[2] = {path, backup};
+    for (int candidate = 0; candidate < 2; candidate++) {
+      FILE *file = fopen(candidates[candidate], "rb");
+      if (file == NULL)
+        continue;
+
+      FtpConfig saved = *cfg;
+      char line[64];
+      int invalidMode = 0;
+      while (fgets(line, sizeof(line), file) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *eq = strchr(line, '=');
+        if (eq == NULL)
+          continue;
+        *eq = '\0';
+        const char *value = eq + 1;
+        if (!strcmp(line, "mode")) {
+          if (!strcmp(value, "dhcp"))
+            saved.mode = FTP_NET_DHCP;
+          else if (!strcmp(value, "static"))
+            saved.mode = FTP_NET_STATIC;
+          else
+            invalidMode = 1;
+        } else if (!strcmp(line, "ip")) {
+          strlcpy(saved.ip, value, sizeof(saved.ip));
+        } else if (!strcmp(line, "mask")) {
+          strlcpy(saved.mask, value, sizeof(saved.mask));
+        } else if (!strcmp(line, "gw")) {
+          strlcpy(saved.gw, value, sizeof(saved.gw));
+        }
+      }
+      int readFailed = ferror(file);
+      fclose(file);
+
+      if (readFailed || invalidMode || ftpValidateConfig(&saved) < 0) {
+        setFtpDiagnostic("stage=config-invalid path=%s", candidates[candidate]);
+        DPRINTF("Network config: ignoring invalid %s\n", candidates[candidate]);
+        continue;
+      }
+      *cfg = saved;
+      strlcpy(LAUNCHER_OPTIONS.udpfsIp, cfg->ip,
+              sizeof(LAUNCHER_OPTIONS.udpfsIp));
+      DPRINTF("Network config: loaded %s%s (%s %s/%s gw %s)\n",
+              candidates[candidate], candidate ? " [recovery]" : "",
+              cfg->mode == FTP_NET_DHCP ? "dhcp" : "static", cfg->ip,
+              cfg->mask, cfg->gw);
+      return 1;
+    }
   }
-  fprintf(file, "mode=%s\n", (cfg->mode == FTP_NET_DHCP) ? "dhcp" : "static");
-  fprintf(file, "ip=%s\n", cfg->ip);
-  fprintf(file, "mask=%s\n", cfg->mask);
-  fprintf(file, "gw=%s\n", cfg->gw);
+
+  if (cfg->ip[0] != '\0')
+    strlcpy(LAUNCHER_OPTIONS.udpfsIp, cfg->ip,
+            sizeof(LAUNCHER_OPTIONS.udpfsIp));
+  return 0;
+}
+
+int ftpSaveConfig(const FtpConfig *cfg) {
+  int result = ftpValidateConfig(cfg);
+  if (result < 0)
+    return result;
+
+  int order[2];
+  getMemoryCardOrder(order);
+  for (int pathIndex = 0; pathIndex < 2; pathIndex++) {
+    const char *path = networkConfigPaths[order[pathIndex]];
+    char temporary[64];
+    char backup[64];
+    if ((snprintf(temporary, sizeof(temporary), "%s.TMP", path) >=
+         (int)sizeof(temporary)) ||
+        (snprintf(backup, sizeof(backup), "%s.BAK", path) >=
+         (int)sizeof(backup)))
+      continue;
+
+    remove(temporary);
+    FILE *file = fopen(temporary, "wb");
+    if (file == NULL)
+      continue;
+
+    int failed = fprintf(file, "mode=%s\n", cfg->mode == FTP_NET_DHCP ? "dhcp" : "static") < 0 ||
+                 fprintf(file, "ip=%s\n", cfg->ip) < 0 ||
+                 fprintf(file, "mask=%s\n", cfg->mask) < 0 ||
+                 fprintf(file, "gw=%s\n", cfg->gw) < 0;
+    if (fclose(file) != 0)
+      failed = 1;
+    if (failed) {
+      remove(temporary);
+      continue;
+    }
+
+    /* Keep the previous complete file readable until the replacement is
+     * complete. ftpLoadConfig() also understands the backup, so even a power
+     * loss precisely between these renames remains recoverable. */
+    int hadOriginal = 0;
+    FILE *original = fopen(path, "rb");
+    if (original != NULL) {
+      hadOriginal = 1;
+      fclose(original);
+      remove(backup);
+      if (rename(path, backup) != 0) {
+        remove(temporary);
+        continue;
+      }
+    }
+    if (rename(temporary, path) != 0) {
+      if (hadOriginal)
+        rename(backup, path);
+      remove(temporary);
+      continue;
+    }
+    remove(backup);
+
+    strlcpy(LAUNCHER_OPTIONS.udpfsIp, cfg->ip,
+            sizeof(LAUNCHER_OPTIONS.udpfsIp));
+    DPRINTF("Network config: saved %s\n", path);
+    return 0;
+  }
+  return -EIO;
+}
+
+static int appendConfigText(char **buffer, size_t *length, size_t *capacity,
+                            const char *text, size_t textLength) {
+  if (*length + textLength + 1 > *capacity) {
+    size_t nextCapacity = *capacity;
+    while (*length + textLength + 1 > nextCapacity)
+      nextCapacity *= 2;
+    char *larger = realloc(*buffer, nextCapacity);
+    if (larger == NULL)
+      return -ENOMEM;
+    *buffer = larger;
+    *capacity = nextCapacity;
+  }
+  memcpy(*buffer + *length, text, textLength);
+  *length += textLength;
+  (*buffer)[*length] = '\0';
+  return 0;
+}
+
+static int updateNeutrinoIPFile(const char *path, const char *ip) {
+  FILE *file = fopen(path, "rb");
+  if (file == NULL)
+    return -ENOENT;
+
+  size_t capacity = 1024;
+  size_t length = 0;
+  char *contents = malloc(capacity);
+  if (contents == NULL) {
+    fclose(file);
+    return -ENOMEM;
+  }
+  contents[0] = '\0';
+
+  char line[256];
+  int found = 0;
+  int changed = 0;
+  int result = 0;
+  while (fgets(line, sizeof(line), file) != NULL) {
+    char *key = line;
+    while ((*key == ' ') || (*key == '\t'))
+      key++;
+
+    char *ipArgument = NULL;
+    if (!strncmp(key, "args", 4))
+      ipArgument = strstr(key, "\"ip=");
+    if (ipArgument != NULL) {
+      char *valueStart = ipArgument + 4;
+      char *valueEnd = strchr(valueStart, '\"');
+      if (valueEnd == NULL) {
+        result = -EINVAL;
+        break;
+      }
+      found = 1;
+      const size_t oldLength = (size_t)(valueEnd - valueStart);
+      const size_t newLength = strlen(ip);
+      if ((oldLength != newLength) || strncmp(valueStart, ip, oldLength)) {
+        changed = 1;
+        result = appendConfigText(&contents, &length, &capacity, line,
+                                  (size_t)(valueStart - line));
+        if (result == 0)
+          result = appendConfigText(&contents, &length, &capacity, ip,
+                                    newLength);
+        if (result == 0)
+          result = appendConfigText(&contents, &length, &capacity, valueEnd,
+                                    strlen(valueEnd));
+      } else {
+        result = appendConfigText(&contents, &length, &capacity, line,
+                                  strlen(line));
+      }
+    } else {
+      result = appendConfigText(&contents, &length, &capacity, line,
+                                strlen(line));
+    }
+    if (result < 0)
+      break;
+  }
+  if (ferror(file) && result == 0)
+    result = -EIO;
   fclose(file);
+
+  if ((result < 0) || !found || !changed) {
+    free(contents);
+    if (result < 0)
+      return result;
+    return found ? 0 : -EINVAL;
+  }
+
+  char temporary[PATH_MAX + 20];
+  char backup[PATH_MAX + 20];
+  if ((snprintf(temporary, sizeof(temporary), "%s.nhddl.tmp", path) >=
+       (int)sizeof(temporary)) ||
+      (snprintf(backup, sizeof(backup), "%s.nhddl.bak", path) >=
+       (int)sizeof(backup))) {
+    free(contents);
+    return -ENAMETOOLONG;
+  }
+
+  file = fopen(temporary, "wb");
+  if (file == NULL) {
+    free(contents);
+    return -EIO;
+  }
+  int failed = (fwrite(contents, 1, length, file) != length);
+  if (fclose(file) != 0)
+    failed = 1;
+  free(contents);
+  if (failed) {
+    remove(temporary);
+    return -EIO;
+  }
+
+  /* Keep the original recoverable until the complete replacement is on the
+   * same memory card. If the second rename fails, restore it immediately. */
+  remove(backup);
+  if (rename(path, backup) != 0) {
+    remove(temporary);
+    return -EIO;
+  }
+  if (rename(temporary, path) != 0) {
+    rename(backup, path);
+    remove(temporary);
+    return -EIO;
+  }
+  remove(backup);
+  DPRINTF("Network config: updated Neutrino IP in %s\n", path);
+  return 1;
+}
+
+int ftpSyncNeutrinoConfig(const FtpConfig *cfg) {
+  int result = ftpValidateConfig(cfg);
+  if (result < 0)
+    return result;
+  if (NEUTRINO_ELF_PATH[0] == '\0')
+    return -ENOENT;
+
+  char configRoot[PATH_MAX + 1];
+  strlcpy(configRoot, NEUTRINO_ELF_PATH, sizeof(configRoot));
+  char *slash = strrchr(configRoot, '/');
+  if (slash == NULL)
+    return -EINVAL;
+  strlcpy(slash + 1, "config/", sizeof(configRoot) -
+                                (size_t)(slash + 1 - configRoot));
+
+  static const char *files[] = {
+      "bsd-udpfs.toml",
+      "bsd-udpbd.toml",
+      "bsd-udpbd-hdd.toml",
+  };
+  int found = 0;
+  int firstError = 0;
+  for (int i = 0; i < (int)(sizeof(files) / sizeof(files[0])); i++) {
+    char path[PATH_MAX + 1];
+    if (snprintf(path, sizeof(path), "%s%s", configRoot, files[i]) >=
+        (int)sizeof(path)) {
+      if (firstError == 0)
+        firstError = -ENAMETOOLONG;
+      continue;
+    }
+    result = updateNeutrinoIPFile(path, cfg->ip);
+    if (result == -ENOENT)
+      continue;
+    found++;
+    if (result < 0 && firstError == 0)
+      firstError = result;
+  }
+  if (firstError < 0)
+    return firstError;
+  return found ? 0 : -ENOENT;
+}
+
+int ftpGetUdpfsConnectionStatus(void) {
+  return fileXioDevctl("udpfs0:", UDPFS_DEVCTL_CONNECTION_STATUS,
+                       NULL, 0, NULL, 0);
+}
+
+int ftpRequestUdpfsReconnect(void) {
+  FtpConfig cfg;
+  int refreshDhcp = 0;
+
+  /* If boot fell back to the saved address because Ethernet was unplugged,
+   * give DHCP one fresh chance before rediscovering the Windows service. A
+   * currently bound lease takes the fast path in applyNetworkConfig(). */
+  if ((ftpLoadConfig(&cfg) >= 0) && (cfg.mode == FTP_NET_DHCP)) {
+    char activeIP[16];
+    int result = ftpAttachSharedNetwork(activeIP, sizeof(activeIP));
+    if (result < 0)
+      return result;
+    refreshDhcp = 1;
+  }
+
+  int reconnectResult = fileXioDevctl("udpfs0:", UDPFS_DEVCTL_RECONNECT,
+                                      NULL, 0, NULL, 0);
+  if ((reconnectResult > 0) && refreshDhcp && (ftpLoadConfig(&cfg) >= 0)) {
+    /* Sync only after UDPFS has a valid session: Neutrino itself may live on
+     * that device. A config-write failure must not hide a successful network
+     * reconnection; the Settings save action reports such failures directly. */
+    int syncResult = ftpSyncNeutrinoConfig(&cfg);
+    if ((syncResult < 0) && (syncResult != -ENOENT))
+      DPRINTF("Network config: post-reconnect Neutrino sync failed: %d\n",
+              syncResult);
+  }
+  return reconnectResult;
 }
 
 int ftpShutdownNetwork(void) {
@@ -371,13 +659,16 @@ static int applyNetworkConfig(const FtpConfig *cfg, const char *ip, const char *
   memset(&info, 0, sizeof(info));
   char netifName[4] = "sm0";
 
-  int ret = ps2ip_init();
-  if (ret < 0) {
-    DPRINTF("FTP: ps2ip_init failed: %d\n", ret);
-    setFtpDiagnostic("stage=ps2ip-init ret=%d", ret);
-    return ret;
+  int ret = 0;
+  if (!ps2ipClientReady) {
+    ret = ps2ip_init();
+    if (ret < 0) {
+      DPRINTF("FTP: ps2ip_init failed: %d\n", ret);
+      setFtpDiagnostic("stage=ps2ip-init ret=%d", ret);
+      return ret;
+    }
+    ps2ipClientReady = 1;
   }
-  ps2ipClientReady = 1;
 
   // ps2ips is the EE RPC bridge to the IOP TCP/IP stack used by ps2ftpd.
   // Its EE getconfig wrapper returns 1 whenever the RPC completed, even when
@@ -425,6 +716,15 @@ static int applyNetworkConfig(const FtpConfig *cfg, const char *ip, const char *
   u32 requestedMask = info.netmask.s_addr;
   u32 requestedGateway = info.gw.s_addr;
   if (cfg->mode == FTP_NET_DHCP) {
+    if (initialDhcpEnabled && (info.dhcp_status == 10) &&
+        (initialAddress != INADDR_ANY)) {
+      formatIPv4(initialAddress, ipOut, ipOutLen);
+      setFtpDiagnostic("stage=ready-dhcp-existing ip=%s raw=%08lx mask=%08lx gw=%08lx",
+                       ipOut, (unsigned long)initialAddress,
+                       (unsigned long)initialMask,
+                       (unsigned long)initialGateway);
+      return 0;
+    }
     info.dhcp_enabled = 1;
   } else {
     if (!parseIPv4(ip, &requestedAddress) ||
@@ -482,7 +782,9 @@ static int applyNetworkConfig(const FtpConfig *cfg, const char *ip, const char *
       formatIPv4(info.ipaddr.s_addr, ipOut, ipOutLen);
       const int addressReady = (cfg->mode == FTP_NET_STATIC)
                                    ? (info.ipaddr.s_addr == requestedAddress)
-                                   : ((info.ipaddr.s_addr != INADDR_ANY) && (info.ipaddr.s_addr != initialAddress));
+                                   : (info.dhcp_enabled &&
+                                      (info.dhcp_status == 10) &&
+                                      (info.ipaddr.s_addr != INADDR_ANY));
       if (addressReady) {
         DPRINTF("FTP: sm0 bound to %s\n", ipOut);
         setFtpDiagnostic("stage=ready-after-set ip=%s raw=%08lx mask=%08lx gw=%08lx dhcp=%lu/%lu",
@@ -551,6 +853,37 @@ int ftpAttachSharedNetwork(char *ipOut, int ipOutLen) {
   if (result < 0) {
     backgroundFtpError = result;
     return result;
+  }
+
+  /* Remember a successful DHCP lease as the deterministic address used by
+   * Neutrino's in-game ministack and as the next boot's fallback. Avoid a
+   * memory-card write when the lease details did not actually change. */
+  if (cfg.mode == FTP_NET_DHCP) {
+    t_ip_info info;
+    for (int index = 0; index < 4; index++) {
+      char netifName[4];
+      snprintf(netifName, sizeof(netifName), "sm%d", index);
+      memset(&info, 0, sizeof(info));
+      if ((ps2ip_getconfig(netifName, &info) > 0) &&
+          !strncmp(info.netif_name, netifName, sizeof(info.netif_name)) &&
+          info.dhcp_enabled && (info.dhcp_status == 10) &&
+          (info.ipaddr.s_addr != INADDR_ANY)) {
+        FtpConfig leased = cfg;
+        formatIPv4(info.ipaddr.s_addr, leased.ip, sizeof(leased.ip));
+        formatIPv4(info.netmask.s_addr, leased.mask, sizeof(leased.mask));
+        formatIPv4(info.gw.s_addr, leased.gw, sizeof(leased.gw));
+        if (strcmp(leased.ip, cfg.ip) || strcmp(leased.mask, cfg.mask) ||
+            strcmp(leased.gw, cfg.gw)) {
+          int saveResult = ftpSaveConfig(&leased);
+          if (saveResult < 0)
+            DPRINTF("Network config: could not cache DHCP lease: %d\n",
+                    saveResult);
+          else
+            cfg = leased;
+        }
+        break;
+      }
+    }
   }
 
   if (ipOut != NULL && ipOutLen > 0)

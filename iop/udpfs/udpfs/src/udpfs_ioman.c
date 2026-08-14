@@ -16,6 +16,8 @@
 
 
 #define UDPFS_MAX_HANDLES 8
+#define UDPFS_DEVCTL_CONNECTION_STATUS 0x55445001
+#define UDPFS_DEVCTL_RECONNECT         0x55445002
 
 
 /* Per-handle state for file descriptor mapping */
@@ -49,6 +51,15 @@ static void _free_fd(int idx)
         g_fds[idx].server_handle = -1;
 }
 
+static void _invalidate_all_fds(void)
+{
+    int i;
+    for (i = 0; i < UDPFS_MAX_HANDLES; i++) {
+        g_fds[i].server_handle = -1;
+        g_fds[i].is_dir = 0;
+    }
+}
+
 /*
  * Helper: validate file descriptor and extract server handle.
  * Returns 0 on success, negative errno on error.
@@ -74,18 +85,21 @@ static int _validate_fd(iomanX_iop_file_t *f, int *fd_idx_out, int32_t *handle_o
 
 static int udpfs_init_dev(iomanX_iop_device_t *d)
 {
-    int i, ret;
+    int ret;
 
     M_DEBUG("%s()\n", __FUNCTION__);
 
     /* Initialize FD table */
-    for (i = 0; i < UDPFS_MAX_HANDLES; i++)
-        g_fds[i].server_handle = -1;
+    _invalidate_all_fds();
 
-    /* Initialize core UDPFS */
+    /* Register the device even when discovery is not ready yet. This lets
+     * the EE report a useful reconnecting state and retry after the cable or
+     * Windows server appears instead of requiring another IOP reboot. */
     ret = udpfs_core_init();
-    if (ret < 0)
-        return -1;
+    if (ret < 0) {
+        M_DEBUG("udpfs: server unavailable; waiting for reconnect\n");
+        return 0;
+    }
 
     M_DEBUG("udpfs: ready\n");
     return 0;
@@ -325,6 +339,23 @@ static int udpfs_umount(iomanX_iop_file_t *f, const char *fsname)
 
 static int udpfs_devctl(iomanX_iop_file_t *f, const char *name, int cmd, void *arg, unsigned int arglen, void *buf, unsigned int buflen)
 {
+    (void)f;
+    (void)name;
+    (void)arg;
+    (void)arglen;
+    (void)buf;
+    (void)buflen;
+
+    if (cmd == UDPFS_DEVCTL_CONNECTION_STATUS)
+        return udpfs_core_is_connected() ? 1 : 0;
+
+    if (cmd == UDPFS_DEVCTL_RECONNECT) {
+        /* Re-discovery creates a new server session. Invalidate every local
+         * descriptor so a stale server handle can never be reused. */
+        _invalidate_all_fds();
+        return (udpfs_core_reconnect() == 0) ? 1 : 0;
+    }
+
     return -EIO;
 }
 
